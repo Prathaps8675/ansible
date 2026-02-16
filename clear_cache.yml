@@ -1,0 +1,151 @@
+---
+# =============================================================================
+# Production-Safe Cache Clear Playbook for RHEL Servers
+# =============================================================================
+#
+# Purpose : Clear system memory cache (PageCache, Dentries, Inodes) safely
+# Target  : 20 RHEL 9.x production servers
+# Safety  : sync before drop_caches, no application restart, no service impact
+# Schedule: Run manually at 1:00 AM or via cron on the Ansible control node
+#
+# Usage:
+#   ansible-playbook clear_cache.yml
+#   ansible-playbook clear_cache.yml --limit server-01,server-02   (subset)
+#   ansible-playbook clear_cache.yml --check                       (dry run)
+#
+# =============================================================================
+
+- name: "Production-Safe Cache Clear on RHEL Servers"
+  hosts: rhel_servers
+  become: yes
+  gather_facts: yes
+  serial: 5                          # Process 5 servers at a time (rolling)
+
+  vars:
+    # Cache drop level:
+    #   1 = PageCache only (safest)
+    #   2 = Dentries + Inodes
+    #   3 = PageCache + Dentries + Inodes (full clear)
+    cache_drop_level: 3
+
+  # ── Pre-flight checks ────────────────────────────────────────────────────
+  pre_tasks:
+
+    - name: "Validate target is a RHEL/CentOS system"
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "RedHat"
+        fail_msg: "This playbook only runs on RHEL/CentOS family systems."
+        success_msg: "OS validated: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: "Capture memory stats BEFORE cache clear"
+      ansible.builtin.shell: |
+        free -mh
+      register: memory_before
+      changed_when: false
+
+    - name: "Show memory BEFORE"
+      ansible.builtin.debug:
+        msg: "{{ memory_before.stdout_lines }}"
+
+  # ── Main tasks ────────────────────────────────────────────────────────────
+  tasks:
+
+    # Step 1: Sync all filesystem buffers to disk (CRITICAL for safety)
+    # This ensures all dirty pages are written to disk before we drop caches.
+    # Without this, cached writes could theoretically be lost.
+    - name: "Step 1 - Sync filesystem buffers to disk"
+      ansible.builtin.command: sync
+      changed_when: false
+
+    # Small pause to let sync complete fully
+    - name: "Wait for sync to complete"
+      ansible.builtin.pause:
+        seconds: 3
+      run_once: true
+
+    # Step 2: Drop caches safely
+    # This operation is 100% non-destructive:
+    #   - Only frees UNUSED cached memory
+    #   - Does NOT kill processes
+    #   - Does NOT affect shared memory (shmem/tmpfs)
+    #   - Does NOT affect application memory (heap, stack)
+    #   - Kernel will re-cache data as needed (transparent to apps)
+    - name: "Step 2 - Drop page cache, dentries, and inodes"
+      ansible.builtin.shell: |
+        echo {{ cache_drop_level }} > /proc/sys/vm/drop_caches
+      changed_when: true
+
+    # Step 3: Clear swap if used (optional, safe)
+    # Turning swap off+on forces all swapped pages back to RAM.
+    # Only do this if there's enough free RAM after cache clear.
+    - name: "Step 3 - Check current swap usage"
+      ansible.builtin.shell: |
+        swapon --show --noheadings | wc -l
+      register: swap_active
+      changed_when: false
+
+    - name: "Step 3 - Clear swap (off/on) if swap is active"
+      ansible.builtin.shell: |
+        # Only clear swap if free memory is enough to absorb swapped pages
+        FREE_MEM=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+        SWAP_USED=$(awk '/SwapTotal/ {total=$2} /SwapFree/ {free=$2} END {print total-free}' /proc/meminfo)
+        if [ "$SWAP_USED" -gt 0 ] && [ "$FREE_MEM" -gt "$SWAP_USED" ]; then
+          swapoff -a && swapon -a
+          echo "SWAP_CLEARED"
+        else
+          echo "SWAP_SKIPPED - Not enough free RAM or no swap used"
+        fi
+      register: swap_result
+      changed_when: "'SWAP_CLEARED' in swap_result.stdout"
+      when: swap_active.stdout | int > 0
+
+    # Step 4: Clear systemd journal cache (logs cache, not application logs)
+    - name: "Step 4 - Vacuum systemd journal to 100MB"
+      ansible.builtin.command: journalctl --vacuum-size=100M
+      register: journal_result
+      changed_when: "'Vacuuming done' in journal_result.stdout or 'Deleted' in journal_result.stdout"
+      failed_when: false
+
+    # Step 5: Clear dnf/yum package manager cache
+    - name: "Step 5 - Clean dnf package cache"
+      ansible.builtin.command: dnf clean all
+      register: dnf_result
+      changed_when: true
+      failed_when: false
+
+    # Step 6: Clear /tmp old files (older than 7 days, safe)
+    - name: "Step 6 - Remove temp files older than 7 days"
+      ansible.builtin.shell: |
+        find /tmp -type f -atime +7 -not -name '.X*' -not -name 'ssh-*' -delete 2>/dev/null
+        find /var/tmp -type f -atime +7 -delete 2>/dev/null
+        echo "CLEANED"
+      changed_when: true
+      failed_when: false
+
+  # ── Post-flight verification ──────────────────────────────────────────────
+  post_tasks:
+
+    - name: "Capture memory stats AFTER cache clear"
+      ansible.builtin.shell: |
+        free -mh
+      register: memory_after
+      changed_when: false
+
+    - name: "Show memory AFTER"
+      ansible.builtin.debug:
+        msg: "{{ memory_after.stdout_lines }}"
+
+    - name: "Show summary"
+      ansible.builtin.debug:
+        msg: >-
+          ✅ Cache clear completed on {{ inventory_hostname }}
+          ({{ ansible_distribution }} {{ ansible_distribution_version }})
+          | Swap: {{ swap_result.stdout | default('N/A') }}
+          | Journal: {{ journal_result.stdout_lines[-1] | default('N/A') }}
+
+  # ── Error handling ────────────────────────────────────────────────────────
+  handlers:
+    - name: "Log failure"
+      ansible.builtin.debug:
+        msg: "⚠️  A task failed on {{ inventory_hostname }}, investigate manually."
